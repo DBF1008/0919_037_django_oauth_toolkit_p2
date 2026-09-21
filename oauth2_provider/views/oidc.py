@@ -1,10 +1,14 @@
 import json
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
+from django.conf import settings
 from django.contrib.auth import logout
 from django.contrib.auth.models import AnonymousUser
-from django.http import HttpResponse, JsonResponse
+from django.core.exceptions import ImproperlyConfigured
+from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseNotFound, JsonResponse
+from django.shortcuts import render
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import FormView, View
@@ -31,6 +35,7 @@ from ..models import (
     get_application_model,
     get_id_token_model,
     get_refresh_token_model,
+    get_user_session_model,
 )
 from ..settings import oauth2_settings
 from ..utils import jwk_from_pem
@@ -38,6 +43,38 @@ from .mixins import OAuthLibMixin, OIDCLogoutOnlyMixin, OIDCOnlyMixin
 
 
 Application = get_application_model()
+UserSession = get_user_session_model()
+
+
+def _origin(url):
+    """Return the RFC 6454 origin (scheme://host[:port]) of an absolute URL."""
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _application_allowed_origins(application):
+    """
+    Collect the origins an Application is allowed to use for session
+    management postMessage communication.
+    """
+    origins = set()
+    for uri in application.redirect_uris.split():
+        origin = _origin(uri)
+        if origin:
+            origins.add(origin)
+    for uri in application.allowed_origins.split():
+        origin = _origin(uri)
+        if origin:
+            origins.add(origin)
+    if application.frontchannel_logout_uri:
+        origin = _origin(application.frontchannel_logout_uri)
+        if origin:
+            origins.add(origin)
+    return origins
 
 
 @method_decorator(login_not_required, name="dispatch")
@@ -62,6 +99,11 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
                 end_session_endpoint = request.build_absolute_uri(
                     reverse("oauth2_provider:rp-initiated-logout")
                 )
+            check_session_iframe = None
+            if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+                check_session_iframe = request.build_absolute_uri(
+                    reverse("oauth2_provider:oidc-check-session-iframe")
+                )
         else:
             parsed_url = urlparse(oauth2_settings.OIDC_ISS_ENDPOINT)
             host = parsed_url.scheme + "://" + parsed_url.netloc
@@ -73,6 +115,11 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
             jwks_uri = "{}{}".format(host, reverse("oauth2_provider:jwks-info"))
             if oauth2_settings.OIDC_RP_INITIATED_LOGOUT_ENABLED:
                 end_session_endpoint = "{}{}".format(host, reverse("oauth2_provider:rp-initiated-logout"))
+            check_session_iframe = None
+            if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+                check_session_iframe = "{}{}".format(
+                    host, reverse("oauth2_provider:oidc-check-session-iframe")
+                )
 
         signing_algorithms = [Application.HS256_ALGORITHM]
         if oauth2_settings.OIDC_RSA_PRIVATE_KEY:
@@ -103,6 +150,13 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
         }
         if oauth2_settings.OIDC_RP_INITIATED_LOGOUT_ENABLED:
             data["end_session_endpoint"] = end_session_endpoint
+        if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            # OpenID Connect Session Management 1.0, Section 3.3
+            data["check_session_iframe"] = check_session_iframe
+        # OpenID Connect Front-Channel Logout 1.0, Section 2.1
+        if oauth2_settings.OIDC_FRONTCHANNEL_LOGOUT_ENABLED:
+            data["frontchannel_logout_supported"] = True
+            data["frontchannel_logout_session_supported"] = True
         response = JsonResponse(data)
         response["Access-Control-Allow-Origin"] = "*"
         return response
@@ -156,6 +210,184 @@ class UserInfoView(OIDCOnlyMixin, OAuthLibMixin, View):
         for k, v in headers.items():
             response[k] = v
         return response
+
+
+@method_decorator(login_not_required, name="dispatch")
+class CheckSessionIframeView(OIDCOnlyMixin, View):
+    """
+    OP iframe for OpenID Connect Session Management 1.0, Section 3.2.
+
+    Serves an invisible HTML page loaded in the OP's security context. The page
+    reads the OP User Agent state from the ``op_browser_state`` cookie and
+    answers cross-origin ``postMessage`` requests from RP iframes with
+    ``unchanged``, ``changed`` or ``error``.
+    """
+
+    template_name = "oauth2_provider/check_session_iframe.html"
+
+    def dispatch(self, request, *args, **kwargs):
+        if not oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            if settings.DEBUG:
+                raise ImproperlyConfigured(
+                    "The OIDC check_session_iframe endpoint is not enabled unless you have configured "
+                    "OIDC_SESSION_MANAGEMENT_ENABLED in the settings"
+                )
+            return HttpResponseNotFound()
+        return super().dispatch(request, *args, **kwargs)
+
+    def get(self, request, *args, **kwargs):
+        # Every registered RP origin may embed the iframe. The rendered
+        # JavaScript still enforces that only registered origins receive
+        # answers to postMessage requests.
+        allowed_origins = set()
+        for application in Application.objects.all():
+            allowed_origins.update(_application_allowed_origins(application))
+
+        context = {
+            "cookie_name": oauth2_settings.OIDC_SESSION_COOKIE_NAME,
+            "allowed_origins_json": json.dumps(sorted(allowed_origins)),
+        }
+        response = render(request, self.template_name, context)
+        # The page runs inside a cross-origin RP frame and only communicates via
+        # postMessage; forbid framing by any other origin not on the allow list
+        # and keep the response out of shared caches.
+        frame_ancestors = " ".join(sorted(allowed_origins)) if allowed_origins else "'none'"
+        response["Content-Security-Policy"] = f"frame-ancestors {frame_ancestors}"
+        # X-Frame-Options cannot express an allow list (which is why CSP
+        # frame-ancestors is used above); omit it so it does not override the
+        # CSP and block legitimate RP embeds.
+        response.headers.pop("X-Frame-Options", None)
+        response["Cache-Control"] = "no-store"
+        return response
+
+
+@method_decorator(login_not_required, name="dispatch")
+class FrontChannelLogoutView(OIDCOnlyMixin, View):
+    """
+    OpenID Provider front-channel logout endpoint implementing OpenID Connect
+    Front-Channel Logout 1.0.
+
+    The endpoint renders an invisible iframe for every Relying Party that
+    registered a ``frontchannel_logout_uri`` and participates in the OP session
+    identified by ``sid``. RPs that require it receive the ``iss`` and ``sid``
+    query parameters.
+    """
+
+    template_name = "oauth2_provider/frontchannel_logout.html"
+
+    def dispatch(self, request, *args, **kwargs):
+        if not oauth2_settings.OIDC_FRONTCHANNEL_LOGOUT_ENABLED:
+            if settings.DEBUG:
+                raise ImproperlyConfigured(
+                    "The OIDC front-channel logout endpoint is not enabled unless you have configured "
+                    "OIDC_FRONTCHANNEL_LOGOUT_ENABLED in the settings"
+                )
+            return HttpResponseNotFound()
+        return super().dispatch(request, *args, **kwargs)
+
+    @staticmethod
+    def build_frontchannel_logout_uri(application, issuer, sid):
+        """
+        Append the ``iss`` and, when the RP requires it, ``sid`` parameters to
+        the registered front-channel logout URI.
+        """
+        parts = urlsplit(application.frontchannel_logout_uri)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["iss"] = issuer
+        if application.frontchannel_logout_session_required:
+            query["sid"] = sid
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    def get_logout_uris(self, request, user_sessions, issuer):
+        """
+        Resolve the unique, fully-qualified RP logout URIs to iframe.
+        """
+        application_ids = {session.application_id for session in user_sessions}
+        applications = Application.objects.filter(id__in=application_ids).exclude(frontchannel_logout_uri="")
+
+        sid_by_application = {session.application_id: session.sid for session in user_sessions}
+
+        uris = []
+        seen = set()
+        for application in applications:
+            sid = sid_by_application.get(application.id)
+            if application.frontchannel_logout_session_required and not sid:
+                continue
+            uri = self.build_frontchannel_logout_uri(application, issuer, sid)
+            if uri not in seen:
+                seen.add(uri)
+                uris.append(uri)
+        return uris
+
+    def render_logout_page(self, request, user_sessions, issuer, post_logout_redirect_url=""):
+        """
+        Revoke the supplied user sessions and render the front-channel logout
+        notification page.
+        """
+        # Idempotency: revoke() only flips active rows; concurrent or repeated
+        # logouts render the same notification page without raising.
+        for user_session in user_sessions:
+            user_session.revoke()
+
+        logout_uris = self.get_logout_uris(request, user_sessions, issuer)
+        context = {
+            "logout_uris": logout_uris,
+            "post_logout_redirect_url": post_logout_redirect_url,
+            "post_logout_redirect_url_json": json.dumps(post_logout_redirect_url),
+            "timeout_ms": oauth2_settings.OIDC_FRONTCHANNEL_LOGOUT_TIMEOUT_MS,
+        }
+        return render(request, self.template_name, context)
+
+    def get(self, request, *args, **kwargs):
+        issuer = oauth2_settings.oidc_issuer(request)
+        iss = request.GET.get("iss")
+        sid = request.GET.get("sid")
+
+        # Per Front-Channel Logout 1.0, Section 3 the OP verifies that the
+        # issuer parameter identifies this OP when it is provided.
+        if iss and iss != issuer:
+            return HttpResponseBadRequest("Invalid issuer.")
+
+        # Only sessions still active need a logout notification; already
+        # revoked sessions (e.g. from a concurrent logout) are skipped, which
+        # keeps repeat calls idempotent.
+        sessions = UserSession.objects.filter(revoked__isnull=True, expires__gt=timezone.now())
+        if sid:
+            sessions = sessions.filter(session_key=sid)
+        elif request.user.is_authenticated:
+            # Without a sid the browser-driven logout covers every RP session
+            # of the currently authenticated End-User.
+            sessions = sessions.filter(user=request.user)
+        else:
+            sessions = sessions.none()
+
+        user_sessions = list(sessions)
+
+        post_logout_redirect_url = ""
+        next_url = request.GET.get("post_logout_redirect_uri", "")
+        if next_url and _is_safe_redirect_url(next_url, request):
+            post_logout_redirect_url = next_url
+
+        response = self.render_logout_page(request, user_sessions, issuer, post_logout_redirect_url)
+
+        # Rotate the OP User Agent state so the check_session_iframe reports
+        # "changed" to any remaining RP frames.
+        response.delete_cookie(oauth2_settings.OIDC_SESSION_COOKIE_NAME)
+        return response
+
+
+def _is_safe_redirect_url(url, request):
+    """
+    Restrict the post-logout continuation URL to same-origin GET targets so the
+    front-channel logout endpoint cannot be used as an open redirector.
+    """
+    if not url:
+        return False
+    parts = urlsplit(url)
+    if parts.scheme or parts.netloc:
+        origin = f"{parts.scheme}://{parts.netloc}"
+        return origin == _origin(request.build_absolute_uri("/"))
+    return url.startswith("/") and not url.startswith("//")
 
 
 def _load_id_token(token):
@@ -454,20 +686,51 @@ class RPInitiatedLogoutView(OIDCLogoutOnlyMixin, FormView):
                 refresh_token.revoke()
         # Logout in Django
         logout(self.request)
-        # Redirect
+        # Determine the final destination after logout
+        final_redirect = None
         if post_logout_redirect_uri:
             if state:
-                return OAuth2ResponseRedirect(
-                    add_params_to_uri(post_logout_redirect_uri, [("state", state)]),
-                    application.get_allowed_schemes(),
-                )
+                final_redirect = add_params_to_uri(post_logout_redirect_uri, [("state", state)])
             else:
-                return OAuth2ResponseRedirect(post_logout_redirect_uri, application.get_allowed_schemes())
+                final_redirect = post_logout_redirect_uri
+
+        # Notify RPs over the front-channel before leaving the OP when the
+        # feature is enabled and the End-User had tracked sessions.
+        if oauth2_settings.OIDC_FRONTCHANNEL_LOGOUT_ENABLED and not isinstance(user, AnonymousUser):
+            user_sessions = list(UserSession.objects.filter(user=user, revoked__isnull=True))
+            if user_sessions:
+                issuer = oauth2_settings.oidc_issuer(self.request)
+                safe_redirect = ""
+                if final_redirect:
+                    # Only registered post logout redirect URIs for the
+                    # requesting application are used as the continuation URL.
+                    if application and application.post_logout_redirect_uri_allowed(post_logout_redirect_uri):
+                        safe_redirect = final_redirect
+                else:
+                    safe_redirect = self.request.build_absolute_uri("/")
+                frontchannel_view = FrontChannelLogoutView()
+                frontchannel_view.request = self.request
+                response = frontchannel_view.render_logout_page(
+                    self.request, user_sessions, issuer, safe_redirect
+                )
+                response.delete_cookie(oauth2_settings.OIDC_SESSION_COOKIE_NAME)
+                return response
+
+        # Redirect
+        if final_redirect:
+            allowed_schemes = (
+                application.get_allowed_schemes()
+                if application is not None
+                else oauth2_settings.ALLOWED_REDIRECT_URI_SCHEMES
+            )
+            response = OAuth2ResponseRedirect(final_redirect, allowed_schemes)
         else:
-            return OAuth2ResponseRedirect(
+            response = OAuth2ResponseRedirect(
                 self.request.build_absolute_uri("/"),
                 oauth2_settings.ALLOWED_REDIRECT_URI_SCHEMES,
             )
+        response.delete_cookie(oauth2_settings.OIDC_SESSION_COOKIE_NAME)
+        return response
 
     def error_response(self, error):
         error_response = {"error": error}

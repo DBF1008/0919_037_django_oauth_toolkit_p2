@@ -1,7 +1,8 @@
 import hashlib
 import json
 import logging
-from urllib.parse import parse_qsl, urlencode, urlparse
+from datetime import timedelta
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit
 
 from django import http
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -19,7 +20,12 @@ from ..compat import login_not_required
 from ..exceptions import OAuthToolkitError
 from ..forms import AllowForm
 from ..http import OAuth2ResponseRedirect
-from ..models import get_access_token_model, get_application_model, get_device_grant_model
+from ..models import (
+    get_access_token_model,
+    get_application_model,
+    get_device_grant_model,
+    get_user_session_model,
+)
 from ..scopes import get_scopes_backend
 from ..settings import oauth2_settings
 from ..signals import app_authorized
@@ -142,9 +148,78 @@ class AuthorizationView(BaseAuthorizationView, FormView):
         except OAuthToolkitError as error:
             return self.error_response(error, application)
 
+        if allow:
+            return self.successful_authorization_response(uri, application)
         self.success_url = uri
         log.debug("Success url for the request: {0}".format(self.success_url))
         return self.redirect(self.success_url, application)
+
+    def successful_authorization_response(self, uri, application):
+        """
+        Build the redirect for a successful Authentication Response, adding
+        the OIDC ``session_state`` parameter and OP User Agent state cookie
+        when OIDC Session Management is enabled.
+        """
+        uri = self.append_session_state(uri, application)
+        self.success_url = uri
+        log.debug("Success url for the request: {0}".format(self.success_url))
+        response = self.redirect(self.success_url, application)
+        self.set_session_management_cookie(response)
+        return response
+
+    def append_session_state(self, uri, application):
+        """
+        Append the OIDC ``session_state`` parameter to a successful
+        Authentication Response redirect URL, per Section 2 of OpenID Connect
+        Session Management 1.0, and record the backing UserSession.
+        """
+        if not oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            return uri
+
+        validator = self.get_oauthlib_core().server.request_validator
+        parsed = urlsplit(uri)
+        # The session state is bound to the RP origin, which is the origin of
+        # the Authentication Response redirect.
+        client_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        op_browser_state = validator.get_or_create_op_browser_state(self.request)
+        salt = validator.generate_session_state_salt()
+        session_state = validator.calculate_session_state(
+            application.client_id, client_origin, op_browser_state, salt
+        )
+
+        UserSession = get_user_session_model()
+        if not self.request.session.session_key:
+            # Persist the OP browser session so a stable Session ID (sid)
+            # exists for Front-Channel Logout correlation.
+            self.request.session.save()
+        UserSession.objects.create(
+            user=self.request.user,
+            application=application,
+            session_key=self.request.session.session_key or "",
+            op_browser_state=op_browser_state,
+            session_state_salt=salt,
+            session_state=session_state,
+            expires=timezone.now() + timedelta(seconds=oauth2_settings.OIDC_SESSION_COOKIE_AGE),
+        )
+
+        separator = "&" if parsed.query else "?"
+        return f"{uri}{separator}session_state={session_state}"
+
+    def set_session_management_cookie(self, response):
+        if not oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            return response
+        op_browser_state = getattr(self.request, "_oidc_op_browser_state", None)
+        if op_browser_state:
+            response.set_cookie(
+                oauth2_settings.OIDC_SESSION_COOKIE_NAME,
+                value=op_browser_state,
+                max_age=oauth2_settings.OIDC_SESSION_COOKIE_AGE,
+                httponly=False,
+                samesite="None",
+                secure=self.request.is_secure(),
+            )
+        return response
 
     def get(self, request, *args, **kwargs):
         try:
@@ -201,7 +276,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                 uri, headers, body, status = self.create_authorization_response(
                     request=self.request, scopes=" ".join(scopes), credentials=credentials, allow=True
                 )
-                return self.redirect(uri, application)
+                return self.successful_authorization_response(uri, application)
 
             elif require_approval == "auto":
                 tokens = (
@@ -221,7 +296,7 @@ class AuthorizationView(BaseAuthorizationView, FormView):
                             credentials=credentials,
                             allow=True,
                         )
-                        return self.redirect(uri, application)
+                        return self.successful_authorization_response(uri, application)
 
         except OAuthToolkitError as error:
             return self.error_response(error, application)

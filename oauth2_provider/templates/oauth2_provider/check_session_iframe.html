@@ -1,0 +1,93 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OP Session Status</title>
+</head>
+<body>
+<script>
+/*
+ * OpenID Connect Session Management 1.0 - OP iframe (Section 3.2)
+ * https://openid.net/specs/openid-connect-session-1_0.html
+ *
+ * The iframe accepts postMessage requests of the shape:
+ *     client_id + " " + session_state
+ * from RP iframes whose origin is registered with the Client and answers with
+ * "unchanged", "changed" or "error".
+ */
+(function () {
+    "use strict";
+
+    // OP User Agent state cookie name and the server-side allow list of RP
+    // origins. Both values are rendered by the OpenID Provider.
+    var STATE_COOKIE_NAME = "{{ cookie_name }}";
+    var ALLOWED_ORIGINS = {{ allowed_origins_json|safe }};
+
+    function readCookie(name) {
+        var match = document.cookie.match(new RegExp("(?:^|; )" + name.replace(/([.$?*|{}()[\]\\/+^])/g, "\\$1") + "=([^;]*)"));
+        return match ? decodeURIComponent(match[1]) : "";
+    }
+
+    async function sha256Hex(text) {
+        if (!window.crypto || !window.crypto.subtle) {
+            return null;
+        }
+        var data = new TextEncoder().encode(text);
+        var digest = await window.crypto.subtle.digest("SHA-256", data);
+        return Array.prototype.map.call(new Uint8Array(digest), function (byte) {
+            return ("00" + byte.toString(16)).slice(-2);
+        }).join("");
+    }
+
+    function isAllowedOrigin(origin) {
+        for (var i = 0; i < ALLOWED_ORIGINS.length; i++) {
+            if (ALLOWED_ORIGINS[i] === origin) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    window.addEventListener("message", async function (event) {
+        var reply = function (status) {
+            if (event.source) {
+                event.source.postMessage(status, event.origin);
+            }
+        };
+
+        // The message MUST come from an origin registered with the RP.
+        if (!event.origin || !isAllowedOrigin(event.origin)) {
+            reply("error");
+            return;
+        }
+
+        var data = String(event.data || "");
+        var separator = data.lastIndexOf(" ");
+        if (separator <= 0 || separator === data.length - 1) {
+            reply("error");
+            return;
+        }
+
+        var clientId = data.substr(0, separator);
+        var sessionState = data.substr(separator + 1);
+        var dotIndex = sessionState.indexOf(".");
+        if (!clientId || !sessionState || dotIndex <= 0 || dotIndex === sessionState.length - 1) {
+            reply("error");
+            return;
+        }
+        var salt = sessionState.substr(dotIndex + 1);
+
+        var opBrowserState = readCookie(STATE_COOKIE_NAME);
+        var digest = await sha256Hex(clientId + " " + event.origin + " " + opBrowserState + " " + salt);
+        if (digest === null) {
+            reply("error");
+            return;
+        }
+        var expected = digest + "." + salt;
+
+        reply(expected === sessionState ? "unchanged" : "changed");
+    }, false);
+})();
+</script>
+</body>
+</html>

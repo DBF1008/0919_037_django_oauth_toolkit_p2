@@ -41,6 +41,8 @@ class ApplicationRegistration(LoginRequiredMixin, CreateView):
                 "post_logout_redirect_uris",
                 "allowed_origins",
                 "algorithm",
+                "frontchannel_logout_uri",
+                "frontchannel_logout_session_required",
             ),
         )
 
@@ -102,5 +104,7 @@ class ApplicationUpdate(ApplicationOwnerIsUserMixin, UpdateView):
                 "post_logout_redirect_uris",
                 "allowed_origins",
                 "algorithm",
+                "frontchannel_logout_uri",
+                "frontchannel_logout_session_required",
             ),
         )

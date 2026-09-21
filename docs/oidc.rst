@@ -24,6 +24,8 @@ We support:
 * OpenID Connect Hybrid Flow
 
 Furthermore ``django-oauth-toolkit`` also supports `OpenID Connect RP-Initiated Logout <https://openid.net/specs/openid-connect-rpinitiated-1_0.html>`_.
+Furthermore it supports `OpenID Connect Session Management 1.0 <https://openid.net/specs/openid-connect-session-1_0.html>`_
+and `OpenID Connect Front-Channel Logout 1.0 <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_.
 
 
 Configuration
@@ -167,6 +169,54 @@ This feature has to be enabled separately as it is an extension to the core stan
        "OIDC_RP_INITIATED_LOGOUT_ALWAYS_PROMPT": True,
        # ... any other settings you want
    }
+
+
+Session Management and Front-Channel Logout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+`OpenID Connect Session Management 1.0 <https://openid.net/specs/openid-connect-session-1_0.html>`_
+allows Relying Parties to detect that the End-User's session at the OpenID
+Provider changed without polling network endpoints, using cross-origin
+``postMessage`` communication between invisible RP and OP iframes.
+
+When enabled, successful OIDC Authentication Responses contain an opaque
+``session_state`` parameter. Its value is
+``SHA256(client_id + " " + origin + " " + op_browser_state + " " + salt) + "." + salt``
+as defined by Section 3.2 of the specification. The OP User Agent state is
+issued in a JavaScript-readable ``op_browser_state`` cookie and backed by a
+``UserSession`` row associating the End-User with the :term:`Client`. Each
+Relying Party loads the OP iframe from ``check_session_iframe`` and sends it
+``client_id + " " + session_state`` messages; the iframe answers with
+``unchanged``, ``changed`` or ``error``.
+
+`OpenID Connect Front-Channel Logout 1.0 <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_
+complements session management by notifying all logged-in Relying Parties of a
+logout through iframes rendered by the OP. Relying Parties that require it are
+called with the ``iss`` (issuer) and ``sid`` (Session ID) query parameters; the
+``sid`` is also included as a Claim in their ID Tokens.
+
+.. code-block:: python
+
+   OAUTH2_PROVIDER = {
+       "OIDC_ENABLED": True,
+       # OpenID Connect Session Management 1.0
+       "OIDC_SESSION_MANAGEMENT_ENABLED": True,
+       # Cookie name / lifetime of the OP User Agent state
+       "OIDC_SESSION_COOKIE_NAME": "op_browser_state",
+       "OIDC_SESSION_COOKIE_AGE": 1209600,
+       # OpenID Connect Front-Channel Logout 1.0
+       "OIDC_FRONTCHANNEL_LOGOUT_ENABLED": True,
+       # Time in ms to wait for RP logout iframes before continuing
+       "OIDC_FRONTCHANNEL_LOGOUT_TIMEOUT_MS": 3500,
+   }
+
+Each :term:`Client` that wants to receive front-channel logout notifications
+must register a ``frontchannel_logout_uri``; clients that correlate the
+notification with a local session additionally set
+``frontchannel_logout_session_required``. Logout notifications are idempotent:
+repeated or concurrent calls only revoke still-active ``UserSession`` rows and
+already logged-out Relying Parties are not notified twice. Expired and revoked
+``UserSession`` rows are removed by the ``cleartokens`` management command.
 
 
 Setting up OIDC enabled clients
@@ -400,10 +450,10 @@ for details.
 OIDC Views
 ==========
 
-Enabling OIDC support adds three views to ``django-oauth-toolkit``. When OIDC
-is not enabled, these views will log that OIDC support is not enabled, and
-return a ``404`` response, or if ``DEBUG`` is enabled, raise an
-``ImproperlyConfigured`` exception.
+Enabling OIDC support adds views to ``django-oauth-toolkit``. When OIDC
+(or the relevant OIDC extension) is not enabled, these views will log that the
+feature is not enabled, and return a ``404`` response, or if ``DEBUG`` is
+enabled, raise an ``ImproperlyConfigured`` exception.
 
 In the docs below, it assumes that you have mounted the
 ``django-oauth-toolkit`` at ``/o/``. If you have mounted it elsewhere, adjust
@@ -449,3 +499,28 @@ RPInitiatedLogoutView
 
 Available at ``/o/logout/``, this view allows a :term:`Client` (Relying Party) to request that a :term:`Resource Owner`
 is logged out at the :term:`Authorization Server` (OpenID Provider).
+
+
+CheckSessionIframeView
+~~~~~~~~~~~~~~~~~~~~~~
+
+Available at ``/o/check_session_iframe/`` when ``OIDC_SESSION_MANAGEMENT_ENABLED`` is set, this view serves the
+invisible OP iframe described in Section 3.2 of the `OpenID Connect Session Management 1.0
+<https://openid.net/specs/openid-connect-session-1_0.html>`_ specification. The iframe reads the
+``op_browser_state`` cookie, recomputes the ``session_state`` from the ``postMessage`` sent by the RP iframe and
+replies with ``unchanged``, ``changed`` or ``error``. Only origins registered with the client (derived from its
+redirect, allowed origin and front-channel logout URIs) receive answers, and the response carries a restrictive
+``Content-Security-Policy: frame-ancestors`` header.
+
+
+FrontChannelLogoutView
+~~~~~~~~~~~~~~~~~~~~~~
+
+Available at ``/o/front-channel-logout/`` when ``OIDC_FRONTCHANNEL_LOGOUT_ENABLED`` is set, this view implements the
+OpenID Provider side of `OpenID Connect Front-Channel Logout 1.0
+<https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_. It accepts the ``iss`` and ``sid`` query
+parameters and renders an invisible iframe per Relying Party that registered a ``frontchannel_logout_uri`` and
+participates in the identified session, appending ``iss`` and ``sid`` when the Relying Party requires session support.
+The page navigates to its same-origin continuation URL once all iframes have loaded or after a short timeout. It is
+also invoked automatically by the RP-Initiated Logout flow so that all logged-in Relying Parties are notified during
+an End-User logout.

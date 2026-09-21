@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenID Provider Logout</title>
+</head>
+<body>
+{#
+    OpenID Connect Front-Channel Logout 1.0
+    https://openid.net/specs/openid-connect-frontchannel-1_0.html
+
+    An invisible iframe is rendered for every Relying Party that registered a
+    frontchannel_logout_uri and participates in the session. When
+    frontchannel_logout_session_required is set the issuer and the Session ID
+    (sid) are appended as query parameters. The page navigates to the
+    post-logout destination once all iframes have loaded (or after a short
+    timeout so a failing RP cannot block the logout flow).
+#}
+{% for uri in logout_uris %}
+<iframe src="{{ uri }}" style="display:none" aria-hidden="true" onload="iframeLoaded()" onerror="iframeLoaded()"></iframe>
+{% endfor %}
+<script>
+(function () {
+    "use strict";
+
+    var total = {{ logout_uris|length }};
+    var loaded = 0;
+    var done = false;
+    var postLogoutUrl = {{ post_logout_redirect_url_json|safe }};
+    var timeoutMs = {{ timeout_ms }};
+
+    function finish() {
+        if (done) {
+            return;
+        }
+        done = true;
+        if (postLogoutUrl) {
+            window.location.replace(postLogoutUrl);
+        }
+    }
+
+    window.iframeLoaded = function () {
+        loaded += 1;
+        if (loaded >= total) {
+            finish();
+        }
+    };
+
+    window.setTimeout(finish, timeoutMs);
+
+    if (total === 0) {
+        finish();
+    }
+})();
+</script>
+</body>
+</html>

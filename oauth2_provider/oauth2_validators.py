@@ -9,7 +9,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 import requests
 from django.conf import settings
@@ -19,7 +19,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import router, transaction
 from django.http import HttpRequest
 from django.utils import dateformat, timezone
-from django.utils.crypto import constant_time_compare
+from django.utils.crypto import constant_time_compare, get_random_string
 from django.utils.timezone import make_aware
 from django.utils.translation import gettext_lazy as _
 from jwcrypto import jws, jwt
@@ -36,6 +36,7 @@ from .models import (
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
+    get_user_session_model,
 )
 from .scopes import get_scopes_backend
 from .settings import oauth2_settings
@@ -66,10 +67,158 @@ AccessToken = get_access_token_model()
 IDToken = get_id_token_model()
 Grant = get_grant_model()
 RefreshToken = get_refresh_token_model()
+UserSession = get_user_session_model()
 UserModel = get_user_model()
 
 
 class OAuth2Validator(RequestValidator):
+    # ------------------------------------------------------------------
+    # OIDC Session Management 1.0
+    # https://openid.net/specs/openid-connect-session-1_0.html
+    # ------------------------------------------------------------------
+
+    #: Algorithm used for the ``session_state`` hash, matching the normative
+    #: SHA-256 reference computation of Section 3.2 of the spec.
+    session_state_hash_algorithm = "sha256"
+
+    @staticmethod
+    def get_origin(url):
+        """
+        Return the origin (``scheme://host[:port]``) of a URL, as defined by
+        Section 4 of RFC 6454. Returns an empty string if no origin can be
+        determined.
+        """
+        if not url:
+            return ""
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
+    @classmethod
+    def calculate_session_state(cls, client_id, origin, op_browser_state, salt):
+        """
+        Calculate the OIDC ``session_state`` value.
+
+        Per Section 3.2 of OpenID Connect Session Management 1.0 the value is a
+        salted cryptographic hash of the Client ID, the source origin URL, the
+        current OP User Agent state and a random salt::
+
+            SHA256(client_id + " " + origin + " " + op_browser_state + " " + salt) + "." + salt
+
+        The salt is appended so that the OP iframe can transparently
+        recalculate the value in the User Agent.
+        """
+        payload = " ".join([client_id, origin, op_browser_state, salt]).encode("utf-8")
+        digest = hashlib.new(cls.session_state_hash_algorithm, payload).hexdigest()
+        return f"{digest}.{salt}"
+
+    @classmethod
+    def generate_session_state_salt(cls):
+        """Generate a fresh random salt for a ``session_state`` value."""
+        return get_random_string(
+            length=32,
+            allowed_chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        )
+
+    @classmethod
+    def generate_op_browser_state(cls):
+        """
+        Generate an opaque OP User Agent state.
+
+        The state is issued as a JavaScript-readable cookie on successful
+        authentication and therefore, per Section 3.2 of the spec, MUST NOT
+        contain identifying information about the End-User.
+        """
+        return get_random_string(length=64)
+
+    @classmethod
+    def validate_session_state(cls, client_id, origin, op_browser_state, session_state):
+        """
+        Verify an OIDC ``session_state`` value in constant time.
+
+        The value must have the ``<digest>.<salt>`` shape and recompute to the
+        same digest for the provided Client ID, origin and OP User Agent state.
+        Malformed values return ``False`` rather than raising, as the OP iframe
+        reports them back to the RP as a ``changed``/``error`` status.
+        """
+        if not all([client_id, origin, op_browser_state, session_state]):
+            return False
+        parts = session_state.rsplit(".", 1)
+        if len(parts) != 2 or not all(parts):
+            return False
+        digest, salt = parts
+        expected = cls.calculate_session_state(client_id, origin, op_browser_state, salt)
+        return constant_time_compare(expected, session_state)
+
+    def get_or_create_op_browser_state(self, request):
+        """
+        Return the current OP User Agent state, generating and persisting a
+        new one when the User Agent does not carry a (valid) state cookie yet.
+        """
+        cookie_name = oauth2_settings.OIDC_SESSION_COOKIE_NAME
+        op_browser_state = request.COOKIES.get(cookie_name, "")
+        if not op_browser_state:
+            op_browser_state = self.generate_op_browser_state()
+            # The response is not available here; AuthorizationView reads the
+            # pending value and sets the cookie on the redirect response.
+            request._oidc_op_browser_state = op_browser_state
+        return op_browser_state
+
+    def create_user_session(self, request, application, origin):
+        """
+        Persist the UserSession backing the OIDC ``session_state`` returned in
+        a successful Authentication Response and return the
+        ``(user_session, session_state)`` pair.
+        """
+        op_browser_state = self.get_or_create_op_browser_state(request)
+        salt = self.generate_session_state_salt()
+        session_state = self.calculate_session_state(application.client_id, origin, op_browser_state, salt)
+        session_key = request.session.session_key or ""
+        expires = timezone.now() + timedelta(seconds=oauth2_settings.OIDC_SESSION_COOKIE_AGE)
+        user_session = UserSession.objects.create(
+            user=request.user,
+            application=application,
+            session_key=session_key,
+            op_browser_state=op_browser_state,
+            session_state_salt=salt,
+            session_state=session_state,
+            expires=expires,
+        )
+        return user_session, session_state
+
+    def validate_user_session(self, user_session, client_id, origin, op_browser_state):
+        """
+        Validate a persisted UserSession against the current User Agent state.
+
+        ``True`` is returned only when the session is not expired or revoked and
+        its ``session_state`` still matches.
+        """
+        if user_session is None or not user_session.is_active():
+            return False
+        return self.validate_session_state(client_id, origin, op_browser_state, user_session.session_state)
+
+    def get_sid_for_request(self, request):
+        """
+        Return the OIDC Session ID (``sid``) for the current request.
+
+        The ``sid`` is the Django OP session key and is resolved through the
+        most recent active UserSession for the End-User and Client.
+        """
+        if not request.user or not getattr(request.user, "is_authenticated", False):
+            return None
+        user_session = (
+            UserSession.objects.filter(
+                user=request.user,
+                application=request.client,
+                revoked__isnull=True,
+                expires__gt=timezone.now(),
+            )
+            .order_by("-created")
+            .first()
+        )
+        return user_session.sid if user_session and user_session.sid else None
+
     # Return the given claim only if the given scope is present.
     # Extended as needed for non-standard OIDC claims/scopes.
     # Override by setting to None to ignore scopes.
@@ -926,6 +1075,14 @@ class OAuth2Validator(RequestValidator):
                 "jti": str(uuid.uuid4()),
             }
         )
+
+        # OpenID Connect Front-Channel Logout 1.0, Section 3: the sid Claim is
+        # carried in the ID Token so that RPs can correlate front-channel
+        # logout notifications with their local sessions.
+        if oauth2_settings.OIDC_FRONTCHANNEL_LOGOUT_ENABLED:
+            sid = self.get_sid_for_request(request)
+            if sid:
+                claims["sid"] = sid
 
         return claims, expiration_time
 

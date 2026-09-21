@@ -73,6 +73,12 @@ class AbstractApplication(models.Model):
     * :attr:`post_logout_redirect_uris` The list of allowed redirect uris after
                                         an RP initiated logout. The string
                                         consists of valid URLs separated by space
+    * :attr:`frontchannel_logout_uri` RP front-channel logout URI notified via
+                                      an iframe when the End-User logs out, as
+                                      in OpenID Connect Front-Channel Logout 1.0
+    * :attr:`frontchannel_logout_session_required` Whether the RP requires the
+                                      ``iss`` and ``sid`` query parameters on
+                                      front-channel logout notifications
     * :attr:`client_type` Client type as described in :rfc:`2.1`
     * :attr:`authorization_grant_type` Authorization flows available to the
                                        Application
@@ -151,6 +157,22 @@ class AbstractApplication(models.Model):
         blank=True,
         help_text=_("Allowed origins list to enable CORS, space separated"),
         default="",
+    )
+    frontchannel_logout_uri = models.URLField(
+        max_length=2048,
+        blank=True,
+        default="",
+        help_text=_(
+            "Relying Party front-channel logout URI. An iframe to this URI is "
+            "rendered when the End-User logs out at the OpenID Provider."
+        ),
+    )
+    frontchannel_logout_session_required = models.BooleanField(
+        default=False,
+        help_text=_(
+            "When enabled, front-channel logout notifications include the "
+            "issuer and the Session ID (sid) of the session being logged out."
+        ),
     )
 
     class Meta:
@@ -656,6 +678,122 @@ class IDToken(AbstractIDToken):
         swappable = "OAUTH2_PROVIDER_ID_TOKEN_MODEL"
 
 
+class AbstractUserSession(models.Model):
+    """
+    A UserSession instance associates an authenticated End-User with the
+    :term:`Client` (Relying Party) sessions they established at the OpenID
+    Provider.
+
+    It backs the OIDC Session Management 1.0
+    (`openid-connect-session-1_0 <https://openid.net/specs/openid-connect-session-1_0.html>`_)
+    ``session_state`` value and the OIDC Front-Channel Logout 1.0 ``sid``
+    Session ID claim, and keeps track of the OP User Agent state stored in the
+    User Agent so that expired sessions can be cleaned up.
+
+    Fields:
+
+    * :attr:`user` The Django user representing the End-User
+    * :attr:`application` Application (RP) the session was established with
+    * :attr:`session_key` The Django session key identifying the OP browser
+                          session; also used as the OIDC ``sid``
+    * :attr:`op_browser_state` The OP User Agent state, issued as a cookie and
+                               used in the ``session_state`` calculation
+    * :attr:`session_state_salt` Random salt embedded in the ``session_state``
+    * :attr:`session_state` The ``session_state`` value returned in the
+                            successful Authentication Response
+    * :attr:`expires` Expiration time used for session cleanup
+    * :attr:`revoked` Set when the session is logged out, making the
+                      ``session_state`` verification fail
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="%(app_label)s_%(class)s",
+    )
+    application = models.ForeignKey(oauth2_settings.APPLICATION_MODEL, on_delete=models.CASCADE)
+    session_key = models.CharField(max_length=40, db_index=True)
+    op_browser_state = models.CharField(max_length=128, db_index=True)
+    session_state_salt = models.CharField(max_length=64)
+    session_state = models.CharField(max_length=128, db_index=True)
+    expires = models.DateTimeField()
+
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+    revoked = models.DateTimeField(null=True, blank=True)
+
+    objects = models.Manager()
+
+    def __str__(self):
+        return f"UserSession user={self.user_id} client={self.application_id} sid={self.session_key}"
+
+    @staticmethod
+    def build_session_state(client_id, user_id, salt):
+        """
+        Build the server-side ``session_state`` binding for an End-User and a
+        :term:`Client`: a SHA-256 hash of the salt, the Client ID and the
+        End-User id, with the salt appended so it stays opaque but verifiable.
+
+        The value handed to the RP and recalculated in the OP iframe also
+        incorporates the RP origin and the OP User Agent state, see
+        ``OAuth2Validator.calculate_session_state`` and Section 3.2 of OpenID
+        Connect Session Management 1.0.
+        """
+        digest = hashlib.sha256(f"{salt}{client_id}{user_id}".encode("utf-8")).hexdigest()
+        return f"{digest}.{salt}"
+
+    @property
+    def sid(self):
+        """The OIDC Session ID as used by Front/Back-Channel Logout."""
+        return self.session_key
+
+    def is_expired(self):
+        """
+        Check session expiration with timezone awareness.
+        """
+        if not self.expires:
+            return True
+        return timezone.now() >= self.expires
+
+    def is_active(self):
+        return self.revoked is None and not self.is_expired()
+
+    def revoke(self):
+        """
+        Mark this user session revoked.
+
+        The revocation is idempotent: if the session was already revoked
+        (possibly by a concurrent logout request) the stored revocation time is
+        preserved and ``False`` is returned.
+        """
+        model = self.__class__
+        database = router.db_for_write(model)
+        with transaction.atomic(using=database):
+            locked = model.objects.select_for_update().filter(pk=self.pk)
+            current = locked.first()
+            if current is None:
+                return False
+            if current.revoked is not None:
+                return False
+            current.revoked = timezone.now()
+            current.save(update_fields=["revoked", "updated"])
+            self.revoked = current.revoked
+            return True
+
+    class Meta:
+        abstract = True
+        indexes = [
+            models.Index(fields=["user", "session_key"]),
+            models.Index(fields=["revoked", "expires"]),
+        ]
+
+
+class UserSession(AbstractUserSession):
+    class Meta(AbstractUserSession.Meta):
+        swappable = "OAUTH2_PROVIDER_USER_SESSION_MODEL"
+
+
 class AbstractDeviceGrant(models.Model):
     class Meta:
         abstract = True
@@ -781,6 +919,11 @@ def get_refresh_token_model():
     return apps.get_model(oauth2_settings.REFRESH_TOKEN_MODEL)
 
 
+def get_user_session_model():
+    """Return the UserSession model that is active in this project."""
+    return apps.get_model(oauth2_settings.USER_SESSION_MODEL)
+
+
 def get_application_admin_class():
     """Return the Application admin class that is active in this project."""
     application_admin_class = oauth2_settings.APPLICATION_ADMIN_CLASS
@@ -836,6 +979,7 @@ def clear_expired():
     refresh_token_model = get_refresh_token_model()
     id_token_model = get_id_token_model()
     grant_model = get_grant_model()
+    user_session_model = get_user_session_model()
     REFRESH_TOKEN_EXPIRE_SECONDS = oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS
 
     if REFRESH_TOKEN_EXPIRE_SECONDS:
@@ -879,6 +1023,15 @@ def clear_expired():
 
     grants_deleted_no = batch_delete(grants, grants_query)
     logger.info("%s Expired grant tokens deleted", grants_deleted_no)
+
+    # Expired and revoked user sessions back the OIDC session management and
+    # front-channel logout features and can be removed once they are no longer
+    # needed for session_state verification or logout notification.
+    user_session_query = models.Q(expires__lt=now) | models.Q(revoked__isnull=False)
+    user_sessions = user_session_model.objects.filter(user_session_query)
+
+    user_sessions_deleted_no = batch_delete(user_sessions, user_session_query)
+    logger.info("%s Expired/revoked user sessions deleted", user_sessions_deleted_no)
 
 
 def redirect_to_uri_allowed(uri, allowed_uris):

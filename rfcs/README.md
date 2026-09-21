@@ -56,6 +56,14 @@ This directory contains plain-text standards documents used by this repository.
 - `openid-connect-backchannel-1_0.txt` - OpenID Connect Back-Channel Logout 1.0
   - Source: https://openid.net/specs/openid-connect-backchannel-1_0.txt
 
+## Specs Referenced But Not Bundled
+
+- OpenID Connect Front-Channel Logout 1.0 - referenced by the
+  `frontchannel_logout_uri`/`sid` implementation and `docs/oidc.rst`.
+  - Source: https://openid.net/specs/openid-connect-frontchannel-1_0.html
+  - The corpus entry is not included because the document is only published as
+    HTML; add a plain-text copy during the next corpus maintenance pass.
+
 ## Notes
 
 - Files are upstream-authored plain text and are intentionally unmodified.

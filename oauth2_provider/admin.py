@@ -12,6 +12,7 @@ from oauth2_provider.models import (
     get_id_token_model,
     get_refresh_token_admin_class,
     get_refresh_token_model,
+    get_user_session_model,
 )
 
 
@@ -59,11 +60,20 @@ class RefreshTokenAdmin(admin.ModelAdmin):
     list_filter = ("application",)
 
 
+class UserSessionAdmin(admin.ModelAdmin):
+    list_display = ("session_key", "user", "application", "expires", "revoked")
+    list_select_related = ("application", "user")
+    raw_id_fields = ("user",)
+    search_fields = ("session_key",) + (("user__email",) if has_email else ())
+    list_filter = ("application", "revoked")
+
+
 application_model = get_application_model()
 access_token_model = get_access_token_model()
 grant_model = get_grant_model()
 id_token_model = get_id_token_model()
 refresh_token_model = get_refresh_token_model()
+user_session_model = get_user_session_model()
 
 application_admin_class = get_application_admin_class()
 access_token_admin_class = get_access_token_admin_class()
@@ -76,3 +86,4 @@ admin.site.register(access_token_model, access_token_admin_class)
 admin.site.register(grant_model, grant_admin_class)
 admin.site.register(id_token_model, id_token_admin_class)
 admin.site.register(refresh_token_model, refresh_token_admin_class)
+admin.site.register(user_session_model, UserSessionAdmin)

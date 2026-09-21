@@ -401,6 +401,44 @@ Whether to delete the access, refresh and ID tokens of the user that is being lo
 The types of applications for which tokens are deleted can be customized with ``RPInitiatedLogoutView.token_types_to_delete``.
 The default is to delete the tokens of all applications if this flag is enabled.
 
+OIDC_SESSION_MANAGEMENT_ENABLED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``False``
+
+Enables `OpenID Connect Session Management 1.0 <https://openid.net/specs/openid-connect-session-1_0.html>`_:
+successful OIDC Authentication Responses include a ``session_state`` parameter and the
+``/o/check_session_iframe/`` OP iframe endpoint becomes available and is advertised in the discovery metadata.
+
+OIDC_SESSION_COOKIE_NAME
+~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``"op_browser_state"``
+
+Name of the cookie carrying the OP User Agent state. The cookie is read by the JavaScript served by the
+check-session OP iframe and therefore is not marked ``HttpOnly`` and never contains identifying End-User data.
+
+OIDC_SESSION_COOKIE_AGE
+~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``1209600`` (14 days, in seconds)
+
+Lifetime of the OP User Agent state cookie and of the ``UserSession`` records backing it. Expired records are
+removed by the ``cleartokens`` management command.
+
+OIDC_FRONTCHANNEL_LOGOUT_ENABLED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``False``
+
+Enables `OpenID Connect Front-Channel Logout 1.0 <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_:
+the ``/o/front-channel-logout/`` endpoint is enabled, ``sid`` is added as a Claim to ID Tokens and the RP-Initiated
+Logout flow notifies all logged-in Relying Parties through iframes. The capability is advertised through the
+``frontchannel_logout_supported`` and ``frontchannel_logout_session_supported`` discovery metadata parameters.
+
+OIDC_FRONTCHANNEL_LOGOUT_TIMEOUT_MS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``3500`` (milliseconds)
+
+Maximum time the front-channel logout page waits for Relying Party logout iframes to finish loading before
+continuing to the post-logout destination, so a single unavailable Relying Party cannot block the logout flow.
+
 OIDC_ISS_ENDPOINT
 ~~~~~~~~~~~~~~~~~
 Default: ``""``
