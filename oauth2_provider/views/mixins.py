@@ -358,3 +358,28 @@ class OIDCLogoutOnlyMixin(OIDCOnlyMixin):
             log.warning(self.debug_error_message)
             return HttpResponseNotFound()
         return super().dispatch(*args, **kwargs)
+
+
+class OIDCSessionManagementOnlyMixin(OIDCOnlyMixin):
+    """
+    Mixin for views that should only be accessible when OIDC Session
+    Management is enabled.
+
+    If either OIDC or OIDC Session Management is not enabled:
+
+    * if DEBUG is True, raises an ImproperlyConfigured exception explaining why
+    * otherwise, returns a 404 response, logging the same warning
+    """
+
+    debug_error_message = (
+        "The django-oauth-toolkit OIDC Session Management views are not enabled unless you "
+        "have configured OIDC_SESSION_MANAGEMENT_ENABLED in the settings"
+    )
+
+    def dispatch(self, *args, **kwargs):
+        if not oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            if settings.DEBUG:
+                raise ImproperlyConfigured(self.debug_error_message)
+            log.warning(self.debug_error_message)
+            return HttpResponseNotFound()
+        return super().dispatch(*args, **kwargs)

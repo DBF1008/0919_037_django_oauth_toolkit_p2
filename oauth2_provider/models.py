@@ -73,6 +73,8 @@ class AbstractApplication(models.Model):
     * :attr:`post_logout_redirect_uris` The list of allowed redirect uris after
                                         an RP initiated logout. The string
                                         consists of valid URLs separated by space
+    * :attr:`frontchannel_logout_uri` The URI of the RP notified via iframe on
+                                      Front-Channel Logout
     * :attr:`client_type` Client type as described in :rfc:`2.1`
     * :attr:`authorization_grant_type` Authorization flows available to the
                                        Application
@@ -129,6 +131,11 @@ class AbstractApplication(models.Model):
     post_logout_redirect_uris = models.TextField(
         blank=True,
         help_text=_("Allowed Post Logout URIs list, space separated"),
+        default="",
+    )
+    frontchannel_logout_uri = models.URLField(
+        blank=True,
+        help_text=_("Front-Channel Logout URI notified by the OP on logout"),
         default="",
     )
     client_type = models.CharField(max_length=32, choices=CLIENT_TYPES)
@@ -656,6 +663,69 @@ class IDToken(AbstractIDToken):
         swappable = "OAUTH2_PROVIDER_ID_TOKEN_MODEL"
 
 
+class AbstractUserSession(models.Model):
+    """
+    A UserSession instance represents an End-User's authenticated session with
+    a Client (RP), tracked to support
+    `OpenID Connect Session Management 1.0 <https://openid.net/specs/openid-connect-session-1_0.html>`_
+    and
+    `OpenID Connect Front-Channel Logout 1.0 <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_.
+
+    Fields:
+
+    * :attr:`user` The Django user owning the session
+    * :attr:`application` Application (RP) the session was established with
+    * :attr:`session_state` Opaque session state value, generated as
+      ``"<hash>.<salt>"`` where ``hash`` is the SHA-256 hex digest of
+      ``salt + client_id + user_id + op_browser_state``
+    * :attr:`expires` Date and time of session expiration, in DateTime format
+    * :attr:`created` Date and time of session creation, in DateTime format
+    * :attr:`updated` Date and time of session update, in DateTime format
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="%(app_label)s_%(class)s",
+    )
+    application = models.ForeignKey(
+        oauth2_settings.APPLICATION_MODEL,
+        on_delete=models.CASCADE,
+    )
+    session_state = models.CharField(max_length=255, unique=True)
+    expires = models.DateTimeField()
+
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    def is_expired(self):
+        """
+        Check session expiration with timezone awareness
+        """
+        if not self.expires:
+            return True
+
+        return timezone.now() >= self.expires
+
+    def __str__(self):
+        return "User: {self.user_id} Application: {self.application_id}".format(self=self)
+
+    class Meta:
+        abstract = True
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "application"],
+                name="%(app_label)s_%(class)s_unique_user_application",
+            ),
+        ]
+
+
+class UserSession(AbstractUserSession):
+    class Meta(AbstractUserSession.Meta):
+        swappable = "OAUTH2_PROVIDER_USER_SESSION_MODEL"
+
+
 class AbstractDeviceGrant(models.Model):
     class Meta:
         abstract = True
@@ -776,6 +846,11 @@ def get_id_token_model():
     return apps.get_model(oauth2_settings.ID_TOKEN_MODEL)
 
 
+def get_user_session_model():
+    """Return the UserSession model that is active in this project."""
+    return apps.get_model(oauth2_settings.USER_SESSION_MODEL)
+
+
 def get_refresh_token_model():
     """Return the RefreshToken model that is active in this project."""
     return apps.get_model(oauth2_settings.REFRESH_TOKEN_MODEL)
@@ -836,6 +911,7 @@ def clear_expired():
     refresh_token_model = get_refresh_token_model()
     id_token_model = get_id_token_model()
     grant_model = get_grant_model()
+    user_session_model = get_user_session_model()
     REFRESH_TOKEN_EXPIRE_SECONDS = oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS
 
     if REFRESH_TOKEN_EXPIRE_SECONDS:
@@ -879,6 +955,12 @@ def clear_expired():
 
     grants_deleted_no = batch_delete(grants, grants_query)
     logger.info("%s Expired grant tokens deleted", grants_deleted_no)
+
+    user_sessions_query = models.Q(expires__lt=now)
+    user_sessions = user_session_model.objects.filter(user_sessions_query)
+
+    user_sessions_deleted_no = batch_delete(user_sessions, user_sessions_query)
+    logger.info("%s Expired user sessions deleted", user_sessions_deleted_no)
 
 
 def redirect_to_uri_allowed(uri, allowed_uris):

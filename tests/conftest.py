@@ -170,6 +170,12 @@ def rp_settings(oauth2_settings):
     return oauth2_settings
 
 
+@pytest.fixture
+def sm_settings(oauth2_settings):
+    oauth2_settings.update(presets.OIDC_SETTINGS_SESSION_MANAGEMENT)
+    return oauth2_settings
+
+
 def generate_access_token(oauth2_settings, application, test_user, client, settings, scope, redirect_uri):
     """
     A helper function that generates an access_token and ID Token for a given Application and User.
@@ -294,6 +300,19 @@ def oidc_non_confidential_tokens(oauth2_settings, public_application, test_user,
         presets.OIDC_SETTINGS_EMAIL_SCOPE,
         "openid",
         "http://other.org",
+    )
+
+
+@pytest.fixture
+def oidc_session_tokens(oauth2_settings, application, test_user, client):
+    return generate_access_token(
+        oauth2_settings,
+        application,
+        test_user,
+        client,
+        presets.OIDC_SETTINGS_SESSION_MANAGEMENT,
+        "openid",
+        "http://example.org",
     )
 
 

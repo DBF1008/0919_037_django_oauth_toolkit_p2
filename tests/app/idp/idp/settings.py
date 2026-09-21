@@ -28,6 +28,7 @@ env = environ.FileAwareEnv(
     SECRET_KEY=(str, "django-insecure-vri27@j_q62e2it4$xiy9ca!7@qgjkhhan(*zs&lz0k@yukbb3"),
     OAUTH2_PROVIDER_OIDC_ENABLED=(bool, True),
     OAUTH2_PROVIDER_OIDC_RP_INITIATED_LOGOUT_ENABLED=(bool, True),
+    OAUTH2_PROVIDER_OIDC_SESSION_MANAGEMENT_ENABLED=(bool, True),
     OAUTH2_PROVIDER_OIDC_RSA_PRIVATE_KEY=(
         str,
         """
@@ -214,6 +215,7 @@ OAUTH2_PROVIDER = {
     "OAUTH_DEVICE_VERIFICATION_URI_COMPLETE": lambda x: f"http://127.0.0.1:8000/o/device?user_code={x}",
     "OIDC_ENABLED": env("OAUTH2_PROVIDER_OIDC_ENABLED"),
     "OIDC_RP_INITIATED_LOGOUT_ENABLED": env("OAUTH2_PROVIDER_OIDC_RP_INITIATED_LOGOUT_ENABLED"),
+    "OIDC_SESSION_MANAGEMENT_ENABLED": env("OAUTH2_PROVIDER_OIDC_SESSION_MANAGEMENT_ENABLED"),
     # this key is just for out test app, you should never store a key like this in a production environment.
     "OIDC_RSA_PRIVATE_KEY": env("OAUTH2_PROVIDER_OIDC_RSA_PRIVATE_KEY"),
     "SCOPES": {

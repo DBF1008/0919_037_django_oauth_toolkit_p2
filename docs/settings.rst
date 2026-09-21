@@ -401,6 +401,24 @@ Whether to delete the access, refresh and ID tokens of the user that is being lo
 The types of applications for which tokens are deleted can be customized with ``RPInitiatedLogoutView.token_types_to_delete``.
 The default is to delete the tokens of all applications if this flag is enabled.
 
+OIDC_SESSION_MANAGEMENT_ENABLED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``False``
+
+When is set to ``False`` (default) the
+`OpenID Connect Session Management <https://openid.net/specs/openid-connect-session-1_0.html>`_
+and
+`OpenID Connect Front-Channel Logout <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_
+endpoints (``check_session_iframe`` and ``frontchannel_logout``) are not enabled and ID tokens
+do not contain a ``sid`` claim.
+
+OIDC_SESSION_EXPIRE_SECONDS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Default: ``1209600`` (2 weeks)
+
+The number of seconds an OIDC ``UserSession`` record is valid for. Expired records are
+deleted by the :ref:`cleartokens <cleartokens>` management command.
+
 OIDC_ISS_ENDPOINT
 ~~~~~~~~~~~~~~~~~
 Default: ``""``

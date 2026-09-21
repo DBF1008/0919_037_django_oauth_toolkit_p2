@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+* Add support for `OpenID Connect Session Management 1.0` and `OpenID Connect Front-Channel Logout 1.0`,
+  enabled with the new `OIDC_SESSION_MANAGEMENT_ENABLED` setting. This adds a `check_session_iframe`
+  endpoint serving the OP iframe (with an `op_browser_state` cookie and `postMessage` based session
+  state polling), a `frontchannel_logout` endpoint accepting `iss` and `sid` parameters that notifies
+  all logged-in RPs concurrently via hidden iframes, a `UserSession` model tracking per (user,
+  application) session state, a `sid` claim in ID tokens, a `frontchannel_logout_uri` field on
+  `Application` and the `OIDC_SESSION_EXPIRE_SECONDS` setting controlling session lifetime.
+
 ### Deprecated
 * Deprecate the `AUTHENTICATION_SERVER_EXP_TIME_ZONE` setting. Token introspection `exp` values are
   Unix timestamps and are always interpreted as UTC per RFC 7662/RFC 7519. The setting still works

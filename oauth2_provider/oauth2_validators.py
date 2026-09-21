@@ -5,6 +5,7 @@ import http.client
 import inspect
 import json
 import logging
+import secrets
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import router, transaction
 from django.http import HttpRequest
 from django.utils import dateformat, timezone
-from django.utils.crypto import constant_time_compare
+from django.utils.crypto import constant_time_compare, salted_hmac
 from django.utils.timezone import make_aware
 from django.utils.translation import gettext_lazy as _
 from jwcrypto import jws, jwt
@@ -36,6 +37,7 @@ from .models import (
     get_grant_model,
     get_id_token_model,
     get_refresh_token_model,
+    get_user_session_model,
 )
 from .scopes import get_scopes_backend
 from .settings import oauth2_settings
@@ -932,6 +934,82 @@ class OAuth2Validator(RequestValidator):
     def get_oidc_issuer_endpoint(self, request):
         return oauth2_settings.oidc_issuer(request)
 
+    def get_op_browser_state(self, user):
+        """
+        Return the OP browser state for the given user.
+
+        The value is a keyed hash of the user primary key, so it identifies
+        the OP login state in the ``op_browser_state`` cookie without
+        exposing the user id to the JavaScript running in the
+        ``check_session_iframe``.
+        """
+        return salted_hmac("oauth2_provider.oidc.op_browser_state", str(user.pk)).hexdigest()
+
+    def _get_session_state_digest(self, salt, client_id, user):
+        """
+        Return the SHA-256 hex digest of ``salt + client_id + user_id + op_browser_state``.
+        """
+        op_browser_state = self.get_op_browser_state(user)
+        digest_input = f"{salt}.{client_id}.{user.pk}.{op_browser_state}"
+        return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+
+    def generate_session_state(self, user, client_id):
+        """
+        Generate a session_state value for the given user and client, per
+        `OpenID Connect Session Management 1.0
+        <https://openid.net/specs/openid-connect-session-1_0.html#CreatingUpdatingSessions>`_.
+
+        The value has the format ``"<hash>.<salt>"`` where ``hash`` is the
+        SHA-256 hex digest of ``salt + client_id + user_id + op_browser_state``.
+        """
+        salt = secrets.token_hex(8)
+        digest = self._get_session_state_digest(salt, client_id, user)
+        return f"{digest}.{salt}"
+
+    def validate_session_state(self, session_state, user, client_id):
+        """
+        Validate a session_state value for the given user and client.
+
+        Returns True only if the value is well formed and its hash matches
+        the hash recomputed from the salt, client_id, user_id and the
+        current OP browser state.
+        """
+        if not session_state or "." not in session_state:
+            return False
+        digest, _, salt = session_state.rpartition(".")
+        if not digest or not salt:
+            return False
+        expected = self._get_session_state_digest(salt, client_id, user)
+        return constant_time_compare(digest, expected)
+
+    def get_or_create_user_session(self, user, application):
+        """
+        Get or create the UserSession tracking the session of the given user
+        with the given application (RP).
+
+        A new session_state is only generated when no UserSession exists yet
+        or the existing one is expired, so that the session state observed by
+        the RP stays stable for the lifetime of the session (e.g. across
+        refresh token grants). ``get_or_create`` relies on the (user,
+        application) uniqueness constraint, which keeps concurrent token
+        requests for the same pair idempotent.
+        """
+        UserSession = get_user_session_model()
+        expires = timezone.now() + timedelta(seconds=oauth2_settings.OIDC_SESSION_EXPIRE_SECONDS)
+        user_session, created = UserSession.objects.get_or_create(
+            user=user,
+            application=application,
+            defaults={
+                "session_state": self.generate_session_state(user, application.client_id),
+                "expires": expires,
+            },
+        )
+        if not created and user_session.is_expired():
+            user_session.session_state = self.generate_session_state(user, application.client_id)
+            user_session.expires = expires
+            user_session.save(update_fields=["session_state", "expires", "updated"])
+        return user_session
+
     def finalize_id_token(self, id_token, token, token_handler, request):
         claims, expiration_time = self.get_id_token_dictionary(token, token_handler, request)
         id_token.update(**claims)
@@ -939,6 +1017,10 @@ class OAuth2Validator(RequestValidator):
         # https://github.com/oauthlib/oauthlib/issues/746
         if "nonce" not in id_token and request.nonce:
             id_token["nonce"] = request.nonce
+
+        if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED and request.user and request.user.is_authenticated:
+            user_session = self.get_or_create_user_session(request.user, request.client)
+            id_token["sid"] = user_session.session_state
 
         header = {
             "typ": "JWT",

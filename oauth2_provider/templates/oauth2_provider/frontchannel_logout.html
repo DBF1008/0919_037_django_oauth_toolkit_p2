@@ -1,0 +1,22 @@
+{% comment %}
+Front-Channel Logout page per OpenID Connect Front-Channel Logout 1.0.
+https://openid.net/specs/openid-connect-frontchannel-1_0.html
+
+Renders one hidden iframe per logged-in RP, pointing at the RP's registered
+frontchannel_logout_uri with iss and sid query parameters, so that all RPs
+are notified of the logout concurrently.
+{% endcomment %}
+{% load i18n %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{% trans "Logout" %}</title>
+</head>
+<body>
+    <p>{% trans "You have been logged out." %}</p>
+    {% for url in iframe_urls %}
+    <iframe src="{{ url }}" hidden sandbox="allow-scripts allow-same-origin"></iframe>
+    {% endfor %}
+</body>
+</html>

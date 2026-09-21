@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+{% comment %}
+OP iframe page per OpenID Connect Session Management 1.0, Section 3.2.
+https://openid.net/specs/openid-connect-session-1_0.html#OPiframe
+
+The RP iframe polls this page with postMessage notifications of the form
+"<client_id> <session_state>". This page recomputes the session state hash
+from the salt, the client_id, the user id and the current op_browser_state
+cookie, and replies "changed", "unchanged" or "error".
+{% endcomment %}
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>check_session_iframe</title>
+</head>
+<body>
+{{ allowed_origins_by_client_id|json_script:"allowed-origins-by-client-id" }}
+{{ op_user_id|json_script:"op-user-id" }}
+<script>
+(function () {
+    "use strict";
+
+    var allowedOriginsByClientId = JSON.parse(
+        document.getElementById("allowed-origins-by-client-id").textContent
+    );
+    var opUserId = JSON.parse(document.getElementById("op-user-id").textContent);
+
+    function getCookie(name) {
+        var prefix = name + "=";
+        var cookies = document.cookie ? document.cookie.split("; ") : [];
+        for (var i = 0; i < cookies.length; i++) {
+            if (cookies[i].indexOf(prefix) === 0) {
+                return decodeURIComponent(cookies[i].substring(prefix.length));
+            }
+        }
+        return "";
+    }
+
+    function sha256Hex(text) {
+        var data = new TextEncoder().encode(text);
+        return crypto.subtle.digest("SHA-256", data).then(function (digest) {
+            return Array.prototype.map.call(new Uint8Array(digest), function (byte) {
+                return ("0" + byte.toString(16)).slice(-2);
+            }).join("");
+        });
+    }
+
+    function receiveMessage(event) {
+        var source = event.source;
+        var origin = event.origin;
+
+        function reply(message) {
+            if (source) {
+                source.postMessage(message, origin);
+            }
+        }
+
+        var data = event.data;
+        if (typeof data !== "string") {
+            reply("error");
+            return;
+        }
+        var separator = data.lastIndexOf(" ");
+        if (separator < 1) {
+            reply("error");
+            return;
+        }
+        var clientId = data.substring(0, separator);
+        var sessionState = data.substring(separator + 1);
+        var saltSeparator = sessionState.lastIndexOf(".");
+        if (saltSeparator < 1) {
+            reply("error");
+            return;
+        }
+        var receivedDigest = sessionState.substring(0, saltSeparator);
+        var salt = sessionState.substring(saltSeparator + 1);
+
+        // Reject postMessage requests from origins that are not registered
+        // for the given client_id, to prevent cross-origin attacks.
+        var allowedOrigins = allowedOriginsByClientId[clientId] || [];
+        if (allowedOrigins.indexOf(origin) === -1) {
+            reply("error");
+            return;
+        }
+
+        if (opUserId === null || !window.crypto || !crypto.subtle) {
+            reply("changed");
+            return;
+        }
+
+        var opBrowserState = getCookie("op_browser_state");
+        var digestInput = salt + "." + clientId + "." + opUserId + "." + opBrowserState;
+        sha256Hex(digestInput).then(function (digest) {
+            reply(digest === receivedDigest ? "unchanged" : "changed");
+        }, function () {
+            reply("error");
+        });
+    }
+
+    window.addEventListener("message", receiveMessage, false);
+})();
+</script>
+</body>
+</html>

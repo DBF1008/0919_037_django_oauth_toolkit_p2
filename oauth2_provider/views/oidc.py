@@ -3,9 +3,11 @@ from urllib.parse import urlparse
 
 from django.contrib.auth import logout
 from django.contrib.auth.models import AnonymousUser
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
+from django.shortcuts import render
 from django.urls import reverse
 from django.utils.decorators import method_decorator
+from django.views.decorators.clickjacking import xframe_options_exempt
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import FormView, View
 from jwcrypto import jwt
@@ -31,10 +33,11 @@ from ..models import (
     get_application_model,
     get_id_token_model,
     get_refresh_token_model,
+    get_user_session_model,
 )
 from ..settings import oauth2_settings
 from ..utils import jwk_from_pem
-from .mixins import OAuthLibMixin, OIDCLogoutOnlyMixin, OIDCOnlyMixin
+from .mixins import OAuthLibMixin, OIDCLogoutOnlyMixin, OIDCOnlyMixin, OIDCSessionManagementOnlyMixin
 
 
 Application = get_application_model()
@@ -62,6 +65,10 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
                 end_session_endpoint = request.build_absolute_uri(
                     reverse("oauth2_provider:rp-initiated-logout")
                 )
+            if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+                check_session_iframe = request.build_absolute_uri(
+                    reverse("oauth2_provider:check-session-iframe")
+                )
         else:
             parsed_url = urlparse(oauth2_settings.OIDC_ISS_ENDPOINT)
             host = parsed_url.scheme + "://" + parsed_url.netloc
@@ -73,6 +80,8 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
             jwks_uri = "{}{}".format(host, reverse("oauth2_provider:jwks-info"))
             if oauth2_settings.OIDC_RP_INITIATED_LOGOUT_ENABLED:
                 end_session_endpoint = "{}{}".format(host, reverse("oauth2_provider:rp-initiated-logout"))
+            if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+                check_session_iframe = "{}{}".format(host, reverse("oauth2_provider:check-session-iframe"))
 
         signing_algorithms = [Application.HS256_ALGORITHM]
         if oauth2_settings.OIDC_RSA_PRIVATE_KEY:
@@ -103,6 +112,8 @@ class ConnectDiscoveryInfoView(OIDCOnlyMixin, View):
         }
         if oauth2_settings.OIDC_RP_INITIATED_LOGOUT_ENABLED:
             data["end_session_endpoint"] = end_session_endpoint
+        if oauth2_settings.OIDC_SESSION_MANAGEMENT_ENABLED:
+            data["check_session_iframe"] = check_session_iframe
         response = JsonResponse(data)
         response["Access-Control-Allow-Origin"] = "*"
         return response
@@ -472,3 +483,133 @@ class RPInitiatedLogoutView(OIDCLogoutOnlyMixin, FormView):
     def error_response(self, error):
         error_response = {"error": error}
         return self.render_to_response(error_response, status=error.status_code)
+
+
+OP_BROWSER_STATE_COOKIE = "op_browser_state"
+
+
+@method_decorator(xframe_options_exempt, name="dispatch")
+@method_decorator(login_not_required, name="dispatch")
+class CheckSessionIframeView(OIDCSessionManagementOnlyMixin, View):
+    """
+    View used to serve the OP iframe per
+    `OpenID Connect Session Management 1.0 Section 3.2
+    <https://openid.net/specs/openid-connect-session-1_0.html#OPiframe>`_.
+
+    The rendered page receives ``"<client_id> <session_state>"`` postMessage
+    notifications from an RP iframe and replies with ``"changed"``,
+    ``"unchanged"`` or ``"error"`` by comparing the received session_state
+    against the current OP browser state stored in the ``op_browser_state``
+    cookie.
+
+    The view is exempt from ``X-Frame-Options`` so that RPs can embed it in
+    a hidden iframe; deployments setting a restrictive CSP must allow
+    framing of this endpoint via the ``frame-ancestors`` directive.
+    """
+
+    template_name = "oauth2_provider/check_session_iframe.html"
+
+    def get_allowed_origins_by_client_id(self):
+        """
+        Return a mapping of client_id to the list of origins that are
+        allowed to postMessage the OP iframe, derived from the registered
+        redirect URIs and allowed origins of each Application.
+        """
+        allowed = {}
+        applications = Application.objects.only("client_id", "redirect_uris", "allowed_origins")
+        for application in applications:
+            origins = set()
+            for uri in application.redirect_uris.split():
+                parsed = urlparse(uri)
+                if parsed.scheme and parsed.netloc:
+                    origins.add(f"{parsed.scheme}://{parsed.netloc}")
+            origins.update(application.allowed_origins.split())
+            allowed[application.client_id] = sorted(origins)
+        return allowed
+
+    def get(self, request, *args, **kwargs):
+        context = {
+            "allowed_origins_by_client_id": self.get_allowed_origins_by_client_id(),
+            "op_user_id": request.user.pk if request.user.is_authenticated else None,
+        }
+        response = render(request, self.template_name, context)
+        # The OP iframe must never be cached: the cookie it sets reflects
+        # the current OP login state.
+        response["Cache-Control"] = "no-store"
+        if request.user.is_authenticated:
+            validator = oauth2_settings.OAUTH2_VALIDATOR_CLASS()
+            response.set_cookie(
+                OP_BROWSER_STATE_COOKIE,
+                validator.get_op_browser_state(request.user),
+                # Cross-site iframes require SameSite=None (which in turn
+                # requires Secure); fall back to Lax on plain http so that
+                # local development keeps working.
+                secure=request.is_secure(),
+                samesite="None" if request.is_secure() else "Lax",
+            )
+        else:
+            response.delete_cookie(OP_BROWSER_STATE_COOKIE)
+        return response
+
+
+@method_decorator(login_not_required, name="dispatch")
+class FrontChannelLogoutView(OIDCSessionManagementOnlyMixin, View):
+    """
+    View used to trigger
+    `OpenID Connect Front-Channel Logout 1.0
+    <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_.
+
+    It accepts ``iss`` and ``sid`` query parameters identifying the OP and
+    the session to terminate, deletes the tracked UserSessions of the
+    session's user, ends the OP Django session and renders a page embedding
+    one iframe per logged-in RP pointing at its registered
+    ``frontchannel_logout_uri`` (with ``iss`` and ``sid`` parameters), so
+    that all RPs are notified concurrently.
+
+    The endpoint is idempotent: repeating a logout for an already
+    terminated session (e.g. concurrent logout requests) renders an empty
+    logout page instead of failing.
+    """
+
+    template_name = "oauth2_provider/frontchannel_logout.html"
+
+    def get(self, request, *args, **kwargs):
+        issuer = request.GET.get("iss")
+        sid = request.GET.get("sid")
+        if not issuer or not sid:
+            return HttpResponseBadRequest("Both 'iss' and 'sid' parameters are required.")
+
+        validator = oauth2_settings.OAUTH2_VALIDATOR_CLASS()
+        if issuer != validator.get_oidc_issuer_endpoint(request):
+            return HttpResponseBadRequest("The 'iss' parameter does not match this OP.")
+
+        UserSession = get_user_session_model()
+        user_session = UserSession.objects.filter(session_state=sid).select_related("user").first()
+        if user_session is None:
+            # The session is unknown or was already terminated: logout is
+            # idempotent, so render an empty logout page.
+            return render(request, self.template_name, {"iframe_urls": []})
+
+        user = user_session.user
+        user_sessions = UserSession.objects.filter(user=user).select_related("application")
+        iframe_urls = []
+        for session in user_sessions:
+            logout_uri = session.application.frontchannel_logout_uri
+            if logout_uri:
+                iframe_urls.append(
+                    add_params_to_uri(logout_uri, [("iss", issuer), ("sid", session.session_state)])
+                )
+
+        # Deleting already-deleted rows is a no-op, which keeps concurrent
+        # logout requests for the same session idempotent.
+        UserSession.objects.filter(user=user).delete()
+
+        if request.user.is_authenticated and request.user == user:
+            logout(request)
+
+        response = render(request, self.template_name, {"iframe_urls": iframe_urls})
+        response["Cache-Control"] = "no-store"
+        # Rotate the OP browser state so that RP iframes polling the
+        # check_session_iframe observe a "changed" session state.
+        response.delete_cookie(OP_BROWSER_STATE_COOKIE)
+        return response

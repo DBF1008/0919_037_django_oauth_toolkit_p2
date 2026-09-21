@@ -169,6 +169,53 @@ This feature has to be enabled separately as it is an extension to the core stan
    }
 
 
+Session Management and Front-Channel Logout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This feature has to be enabled separately as it is an extension to the core standard.
+
+.. code-block:: python
+
+   OAUTH2_PROVIDER = {
+       # OIDC has to be enabled to use Session Management
+       "OIDC_ENABLED": True,
+       # Enable and configure OIDC Session Management
+       "OIDC_SESSION_MANAGEMENT_ENABLED": True,
+       # ... any other settings you want
+   }
+
+
+Enabling it implements
+`OpenID Connect Session Management 1.0 <https://openid.net/specs/openid-connect-session-1_0.html>`_
+and
+`OpenID Connect Front-Channel Logout 1.0 <https://openid.net/specs/openid-connect-frontchannel-1_0.html>`_:
+
+* Each ID token issued to an authenticated user contains a ``sid`` claim
+  carrying the session state. The session state is tracked in a
+  ``UserSession`` record per (user, application) pair and is generated as
+  ``"<hash>.<salt>"`` where ``hash`` is the SHA-256 hex digest of
+  ``salt + client_id + user_id + op_browser_state``.
+* The ``check_session_iframe`` endpoint (eg ``/o/check-session-iframe/``)
+  serves the OP iframe. It sets an ``op_browser_state`` cookie and replies
+  to RP ``postMessage`` polls with ``"changed"``, ``"unchanged"`` or
+  ``"error"``. The endpoint is advertised as ``check_session_iframe`` in
+  the OIDC discovery metadata. It is exempt from ``X-Frame-Options``; if
+  you deploy a restrictive Content Security Policy you must allow framing
+  of this endpoint with the ``frame-ancestors`` directive.
+* The ``frontchannel_logout`` endpoint (eg
+  ``/o/frontchannel-logout/?iss=...&sid=...``) terminates the session
+  identified by ``sid``, ends the OP Django session and renders hidden
+  iframes pointing at the ``frontchannel_logout_uri`` of every application
+  the user is logged in to, so that all RPs are notified concurrently.
+  Register the ``frontchannel_logout_uri`` on each ``Application`` that
+  wants to receive logout notifications. The endpoint is idempotent:
+  repeating a logout for an already terminated session renders an empty
+  logout page.
+
+Expired ``UserSession`` records are deleted by the
+:ref:`cleartokens <cleartokens>` management command; the session lifetime
+is controlled by ``OIDC_SESSION_EXPIRE_SECONDS``.
+
+
 Setting up OIDC enabled clients
 ===============================
 

@@ -15,6 +15,13 @@ from .generic import (
     ScopedProtectedResourceView,
 )
 from .introspect import IntrospectTokenView
-from .oidc import ConnectDiscoveryInfoView, JwksInfoView, RPInitiatedLogoutView, UserInfoView
+from .oidc import (
+    CheckSessionIframeView,
+    ConnectDiscoveryInfoView,
+    FrontChannelLogoutView,
+    JwksInfoView,
+    RPInitiatedLogoutView,
+    UserInfoView,
+)
 from .token import AuthorizedTokenDeleteView, AuthorizedTokensListView
 from .device import DeviceAuthorizationView, DeviceUserCodeView, DeviceConfirmView, DeviceGrantStatusView

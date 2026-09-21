@@ -37,6 +37,7 @@ ACCESS_TOKEN_MODEL = getattr(settings, "OAUTH2_PROVIDER_ACCESS_TOKEN_MODEL", "oa
 ID_TOKEN_MODEL = getattr(settings, "OAUTH2_PROVIDER_ID_TOKEN_MODEL", "oauth2_provider.IDToken")
 GRANT_MODEL = getattr(settings, "OAUTH2_PROVIDER_GRANT_MODEL", "oauth2_provider.Grant")
 REFRESH_TOKEN_MODEL = getattr(settings, "OAUTH2_PROVIDER_REFRESH_TOKEN_MODEL", "oauth2_provider.RefreshToken")
+USER_SESSION_MODEL = getattr(settings, "OAUTH2_PROVIDER_USER_SESSION_MODEL", "oauth2_provider.UserSession")
 
 DEFAULTS = {
     "CLIENT_ID_GENERATOR_CLASS": "oauth2_provider.generators.ClientIdGenerator",
@@ -74,6 +75,7 @@ DEFAULTS = {
     "DEVICE_FLOW_INTERVAL": 5,
     "GRANT_MODEL": GRANT_MODEL,
     "REFRESH_TOKEN_MODEL": REFRESH_TOKEN_MODEL,
+    "USER_SESSION_MODEL": USER_SESSION_MODEL,
     "APPLICATION_ADMIN_CLASS": "oauth2_provider.admin.ApplicationAdmin",
     "ACCESS_TOKEN_ADMIN_CLASS": "oauth2_provider.admin.AccessTokenAdmin",
     "GRANT_ADMIN_CLASS": "oauth2_provider.admin.GrantAdmin",
@@ -108,6 +110,8 @@ DEFAULTS = {
     "OIDC_RP_INITIATED_LOGOUT_STRICT_REDIRECT_URIS": False,
     "OIDC_RP_INITIATED_LOGOUT_ACCEPT_EXPIRED_TOKENS": True,
     "OIDC_RP_INITIATED_LOGOUT_DELETE_TOKENS": True,
+    "OIDC_SESSION_MANAGEMENT_ENABLED": False,
+    "OIDC_SESSION_EXPIRE_SECONDS": 1209600,
     # Special settings that will be evaluated at runtime
     "_SCOPES": [],
     "_DEFAULT_SCOPES": [],
